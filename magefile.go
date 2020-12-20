@@ -31,11 +31,14 @@ var (
 
 	// By default we look for a local clone of the contentRepo at
 	// ../REPO_NAME, e.g. ../example-site-content. Override with
-	// the environment variable CONTENT_REPO if necessary.
-	localContentEnvVar = "CONTENT_REPO"
+	// the environment variable CONTENT_REPOS if necessary.
+	localContentEnvVar = "CONTENT_REPOS"
 
 	// The repository that contains your content
-	contentRepo = "github.com/carolynvs/example-site-content"
+	contentRepos = []string{
+		"github.com/carolynvs/example-site-content",
+		"github.com/carolynvs/example-site-docs",
+	}
 )
 
 const (
@@ -53,14 +56,14 @@ func Build() error {
 	mg.Deps(clean, buildImage)
 
 	// Build the volume mount for a local contribute repo, if present
-	contentMount, goModMount, err := useLocalContent()
+	contentMounts, goModMount, err := useLocalContent()
 	if err != nil {
 		return err
 	}
 
 	pwd, _ := os.Getwd()
-	return sh.RunV("docker", shx.CollapseArgs("run", "--rm", "-v", pwd+":/src",
-		contentMount, goModMount, containerName, "--debug", "--verbose")...)
+	return sh.RunV("docker", expandArgs("run", "--rm", "-v", pwd+":/src",
+		contentMounts, goModMount, containerName, "--debug", "--verbose")...)
 }
 
 // Run a local server to preview the website and watch for changes.
@@ -68,15 +71,15 @@ func Preview() error {
 	mg.Deps(clean, buildImage)
 
 	// Build the volume mount for a local content repo, if present
-	contentMount, goModMount, err := useLocalContent()
+	contentMounts, goModMount, err := useLocalContent()
 	if err != nil {
 		return err
 	}
 
 	port := getPort()
 	pwd, _ := os.Getwd()
-	err = sh.RunV("docker", shx.CollapseArgs("run", "-d", "-v", pwd+":/src",
-		contentMount, goModMount, "-p", port+":1313",
+	err = sh.RunV("docker", expandArgs("run", "-d", "-v", pwd+":/src",
+		contentMounts, goModMount, "-p", port+":1313",
 		"--name", containerName, img, "server", "--debug", "--verbose",
 		"--buildDrafts", "--buildFuture", "--noHTTPCache", "--watch", "--bind=0.0.0.0")...)
 	if err != nil {
@@ -94,28 +97,106 @@ func Preview() error {
 
 // Use hugo in a docker container.
 func Hugo() error {
+	mg.Deps(clean, buildImage)
+
 	// Build the volume mount for a local content repo, if present
-	contentMount, goModMount, err := useLocalContent()
+	contentMounts, goModMount, err := useLocalContent()
 	if err != nil {
 		return err
 	}
 
 	pwd, _ := os.Getwd()
-	cmd := sh.Command("docker", shx.CollapseArgs("run", "--rm", "-it", "-v", pwd+":/src",
-		contentMount, goModMount, img, "shell")...).
+	args := []string{}
+	for _, m := range contentMounts {
+		args = append(args, m)
+	}
+	cmd := sh.Command("docker", expandArgs("run", "--rm", "-it", "-v", pwd+":/src",
+		contentMounts, goModMount, img, "shell")...).
 		Stdout(os.Stdout)
 	cmd.Cmd.Stdin = os.Stdin
 	_, _, err = cmd.Run()
 	return errors.Wrap(err, "could not start hugo in a container")
 }
 
+// expandArgs takes any arrays and makes them separate arguments,
+// and then removes empty arguments.
+func expandArgs(args ...interface{}) []string {
+	expandedArgs := make([]string, len(args))
+	for _, arg := range args {
+		if combinedArg, ok := arg.([]string); ok {
+			for _, a := range combinedArg {
+				expandedArgs = append(expandedArgs, a)
+			}
+		} else if stringArg, ok := arg.(string); ok {
+			expandedArgs = append(expandedArgs, stringArg)
+		}
+	}
+	return shx.CollapseArgs(expandedArgs...)
+}
+
 // Create go.local.mod with any appropriate replace statements, and
-// returns the local content mount flag if present.
-func useLocalContent() (contentMount string, goModMount string, err error) {
+// returns the local content mount flags if present.
+func useLocalContent() (contentMounts []string, goModMount string, err error) {
+	// package name=local path,package name=local path
+	// e.g. github.com/carolynvs/example-site-content=../content
+	localContent := map[string]string{}
+	contentOverrides := os.Getenv(localContentEnvVar)
+	for _, override := range strings.Split(contentOverrides, ",") {
+		parts := strings.Split(override, "=")
+		if len(parts) != 2 {
+			return nil, "", errors.Errorf(
+				`overrides in CONTENT_REPOS is incorrectly formatted, expected "package name=local path,package name=local path"
+For example, "github.com/carolynvs/example-site-content=../content,github.com/carolynvs/example-site-docs=../docs"
+Got: %q`, contentOverrides)
+		}
+
+		contentRepo := parts[0]
+		path := parts[1]
+		localContent[contentRepo] = path
+	}
+
+	contentMounts = make([]string, 0, len(contentRepos))
+	for _, contentRepo := range contentRepos {
+		contentMount, err := buildContentMount(contentRepo, localContent[contentRepo])
+		if err != nil {
+			return nil, "", err
+		}
+
+		if contentMount != "" {
+			contentMounts = append(contentMounts, contentMount)
+		}
+	}
+
+	if len(contentMounts) == 0 {
+		return nil, "", nil
+	}
+
+	pwd, _ := os.Getwd()
+	localGoMod := filepath.Join(pwd, "go.local.mod")
+	err = copyFile("go.mod", localGoMod)
+	if err != nil {
+		return nil, "", err
+	}
+	goModMount = fmt.Sprintf("-v=%s:/src/go.mod", localGoMod)
+
+	args := []string{"run", "--rm", "--entrypoint", "go", "-v", pwd + ":/src",
+		goModMount, img, "mod", "edit"}
+	for contentRepo := range localContent {
+		contentDirName := path.Base(contentRepo)
+		args = append(args, "-replace", contentRepo+"=/src/"+contentDirName)
+	}
+	err = sh.RunV("docker", args...)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "could not modify go.mod to use your local content repositories")
+	}
+
+	return contentMounts, goModMount, nil
+}
+
+func buildContentMount(contentRepo string, localContent string) (contentMount string, err error) {
 	contentDirName := path.Base(contentRepo)
-	localContent := filepath.Join("..", contentDirName)
-	if overrideLocalContent, ok := os.LookupEnv(localContentEnvVar); ok {
-		localContent = overrideLocalContent
+	if localContent == "" {
+		localContent = filepath.Join("..", contentDirName)
 	}
 	localContentPath, _ := filepath.Abs(localContent)
 
@@ -126,27 +207,12 @@ func useLocalContent() (contentMount string, goModMount string, err error) {
 	// Only mount the local repo if it exists, otherwise use the one on github
 	_, err = os.Stat(localContentPath)
 	if err != nil {
-		return "", "", nil
+		return "", nil
 	}
 
 	log.Printf("Using your local copy of %s -> %s\n", contentRepo, localContentPath)
-	pwd, _ := os.Getwd()
-	localGoMod := filepath.Join(pwd, "go.local.mod")
-	err = copyFile("go.mod", localGoMod)
-	if err != nil {
-		return "", "", err
-	}
-	goModMount = fmt.Sprintf("-v=%s:/src/go.mod", localGoMod)
-
-	err = sh.RunV("docker", "run", "--rm", "--entrypoint", "go",
-		"-v", pwd+":/src", goModMount, img,
-		"mod", "edit", "-replace", contentRepo+"=/src/"+contentDirName)
-	if err != nil {
-		return "", "", errors.Wrapf(err, "could not modify go.mod to use your local copy of %s", contentRepo)
-	}
-
 	contentMount = fmt.Sprintf("-v=%s:/src/"+contentDirName, localContentPath)
-	return contentMount, goModMount, nil
+	return contentMount, nil
 }
 
 func copyFile(src string, dest string) error {
